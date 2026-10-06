@@ -809,7 +809,9 @@ impl<
 
     /// Get an existing item, but if that item doesn't already exist,
     /// execute the future `fut` to provide a value that will be inserted and then
-    /// returned.  This is done atomically wrt. other callers.
+    /// returned. Population is coordinated with other callers, but if coordination
+    /// exhausts its retries, `fut` is run directly and may overlap with another
+    /// caller's population.
     /// The TTL parameter is a function that can extract the TTL from the value type,
     /// or just return a constant TTL.
     pub async fn get_or_try_insert<E: Into<anyhow::Error>, TTL: FnOnce(&V) -> Duration>(
@@ -992,10 +994,27 @@ impl<
             }
         }
 
-        return Err(Arc::new(anyhow::anyhow!(
-            "{} lookup for {name:?} failed after {MAX_ATTEMPTS} attempts",
+        tracing::warn!(
+            "{} cache population coordination exhausted {MAX_ATTEMPTS} attempts; \
+            falling back to running the population future directly",
             self.inner.name
-        )));
+        );
+
+        let item = fut.await.map_err(|err| {
+            self.inner.error_counter.inc();
+            Arc::new(err.into())
+        })?;
+        self.inner.populate_counter.inc();
+        let now = Instant::now();
+        let ttl = ttl_func(&item);
+        let expiration = now + ttl;
+        self.insert(name.clone(), item.clone(), expiration).await;
+
+        Ok(ItemLookup {
+            item,
+            expiration,
+            is_fresh: true,
+        })
     }
 }
 
@@ -1003,6 +1022,92 @@ impl<
 mod test {
     use super::*;
     use test_log::test; // run with RUST_LOG=lruttl=trace to trace
+
+    fn cache_with_expired_pending(name: &str) -> LruCacheWithTtl<u64, u64> {
+        let cache = LruCacheWithTtl::new(name, 1);
+        cache
+            .inner
+            .sema_timeout_milliseconds
+            .store(0, Ordering::Relaxed);
+        cache.inner.cache.insert(
+            0,
+            Item {
+                item: ItemState::Pending(Arc::new(Semaphore::new(1))),
+                expiration: Instant::now(),
+                last_tick: 0.into(),
+            },
+        );
+        cache
+    }
+
+    #[test(tokio::test)]
+    async fn test_coordination_exhaustion_falls_back() {
+        tokio::time::pause();
+        // A zero deadline replaces the semaphore on every state check, forcing
+        // all ten attempts to encounter mismatched semaphores.
+        let cache = cache_with_expired_pending("test_coordination_exhaustion_falls_back");
+        let ttl = Duration::from_secs(30);
+        let expiration = Instant::now() + ttl;
+        let mut populations = 0;
+        let mut ttl_calls = 0;
+        let result = cache
+            .get_or_try_insert(
+                &0,
+                |item| {
+                    assert_eq!(*item, 42);
+                    ttl_calls += 1;
+                    ttl
+                },
+                async {
+                    populations += 1;
+                    Ok::<_, anyhow::Error>(42)
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.item, 42);
+        assert!(result.is_fresh);
+        assert_eq!(result.expiration, expiration);
+        assert_eq!(populations, 1);
+        assert_eq!(ttl_calls, 1);
+        assert_eq!(cache.inner.populate_counter.get(), 1);
+        assert_eq!(cache.inner.error_counter.get(), 10);
+        assert_eq!(cache.inner.wait_gauge.get(), 0);
+        assert_eq!(cache.inner.size_gauge.get(), 1);
+        let cached = cache.lookup(&0).unwrap();
+        assert_eq!(cached.item, 42);
+        assert!(!cached.is_fresh);
+        assert_eq!(cached.expiration, expiration);
+        tokio::time::advance(ttl).await;
+        assert!(cache.get(&0).is_none());
+    }
+
+    #[test(tokio::test)]
+    async fn test_coordination_exhaustion_returns_population_error() {
+        tokio::time::pause();
+        let cache =
+            cache_with_expired_pending("test_coordination_exhaustion_returns_population_error");
+        let mut populations = 0;
+        let error = cache
+            .get_or_try_insert(
+                &0,
+                |_| panic!("TTL must not be evaluated on population failure"),
+                async {
+                    populations += 1;
+                    Err::<u64, _>(anyhow::anyhow!("population failed"))
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "population failed");
+        assert_eq!(populations, 1);
+        assert_eq!(cache.inner.populate_counter.get(), 0);
+        assert_eq!(cache.inner.error_counter.get(), 11);
+        assert_eq!(cache.inner.wait_gauge.get(), 0);
+        assert!(cache.get(&0).is_none());
+    }
 
     #[test(tokio::test)]
     async fn test_capacity() {
