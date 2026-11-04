@@ -53,6 +53,12 @@
 
 ## Other Changes and Enhancements
 
+ * [HTTP listeners](../reference/kumo/start_http_listener/index.md) now support
+   Zstandard request decompression via `Content-Encoding: zstd` and negotiated
+   response compression via `Accept-Encoding: zstd`. This applies to KumoMTA,
+   TSA, and proxy HTTP listeners. Existing gzip, deflate, and uncompressed
+   clients remain supported; request body limits still apply after decompression.
+
  * Implicit TLS (SMTPS) is now supported on both the inbound and outbound SMTP
    paths.
    [kumo.start_esmtp_listener](../reference/kumo/start_esmtp_listener/index.md)

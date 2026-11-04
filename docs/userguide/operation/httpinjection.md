@@ -54,8 +54,10 @@ system if you follow the JSON payload formatting rules posted
 ## Compressed requests
 
 The HTTP listener accepts request bodies compressed with gzip, deflate (zlib),
-or Zstandard. Compress the JSON payload and set `Content-Encoding` to `gzip`,
-`deflate`, or `zstd`, respectively, while keeping `Content-Type: application/json`.
+or Zstandard ({{since('dev', inline=True)}}). Compress the JSON payload and set
+`Content-Encoding` to `gzip`, `deflate`, or `zstd`, respectively, while keeping
+`Content-Type: application/json`. Zstandard bodies must not depend on an external
+compression dictionary.
 For example, to submit an existing `payload.json` using Zstandard:
 
 ```console
@@ -68,8 +70,7 @@ $ zstd -1 -c payload.json | curl --fail-with-body \
 
 Use the authentication required by your listener configuration. Uncompressed
 requests remain supported. Request decompression is shared by the HTTP listeners
-used by KumoMTA, TSA, and the proxy; this does not enable Zstandard response
-compression.
+used by KumoMTA, TSA, and the proxy.
 
 The listener's
 [`request_body_limit`](../../reference/kumo/start_http_listener/request_body_limit.md)
@@ -79,3 +80,19 @@ This limit does not bound all decoder memory (such as the Zstandard frame's
 window) or decompression CPU usage. Decoding also occurs before the injection
 concurrency limit is acquired, so size listener admission controls and client
 concurrency accordingly.
+
+## Compressed responses
+
+Response compression is negotiated independently from request compression.
+Send `Accept-Encoding: zstd` to allow Zstandard responses
+({{since('dev', inline=True)}}), or advertise gzip and deflate according to your
+client's capabilities. Eligible responses are compressed using a supported
+encoding and returned with the corresponding `Content-Encoding` header. Your
+client must decode that encoding before processing the response.
+
+A compressed request does not imply a compressed response. Clients that do not
+advertise Zstandard, or explicitly set `zstd;q=0`, will not receive Zstandard
+responses. Small responses, including some injection results, may remain
+uncompressed even when compression is advertised. See the
+[HTTP listener](../../reference/kumo/start_http_listener/index.md) documentation
+for details shared by all HTTP endpoints.

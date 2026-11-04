@@ -319,13 +319,81 @@ async fn http_inject_unsupported_compression() -> anyhow::Result<()> {
         .send()
         .await?;
 
-    // Should return error for unsupported encoding
-    anyhow::ensure!(
-        response.status() != 200,
-        "Expected error for unsupported encoding"
-    );
+    assert_equal!(response.status(), 415);
+    let supported = response.headers()["Accept-Encoding"].to_str()?;
+    assert!(supported
+        .split(',')
+        .any(|encoding| encoding.trim() == "zstd"));
 
     daemon.stop_both().await.context("stop_both")?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_response_compression() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let mut daemon = DaemonWithMaildir::start()
+        .await
+        .context("DaemonWithMaildir::start")?;
+    let client = reqwest::Client::builder()
+        .no_gzip()
+        .no_deflate()
+        .no_brotli()
+        .no_zstd()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let endpoint = format!(
+        "http://{}/api-docs/openapi.json",
+        daemon.source.listener("http")
+    );
+    let baseline = client.get(&endpoint).send().await?;
+    assert_equal!(baseline.status(), 200);
+    assert!(baseline.headers().get("Content-Encoding").is_none());
+    let expected = baseline.bytes().await?;
+    assert!(expected.len() > 32);
+
+    for (accept, encoding) in [
+        ("identity", None),
+        ("gzip", Some("gzip")),
+        ("deflate", Some("deflate")),
+        ("zstd", Some("zstd")),
+        ("zstd;q=0", None),
+        ("zstd;q=0, gzip", Some("gzip")),
+        ("zstd, gzip;q=0.5", Some("zstd")),
+        ("gzip, zstd;q=0.5", Some("gzip")),
+    ] {
+        let response = client
+            .get(&endpoint)
+            .header("Accept-Encoding", accept)
+            .send()
+            .await?;
+        assert_equal!(response.status(), 200);
+        assert_equal!(
+            response
+                .headers()
+                .get("Content-Encoding")
+                .map(|h| h.to_str().unwrap()),
+            encoding
+        );
+        let body = response.bytes().await?;
+        let mut decoded = Vec::new();
+        match encoding {
+            Some("gzip") => {
+                flate2::read::GzDecoder::new(body.as_ref()).read_to_end(&mut decoded)?;
+            }
+            Some("deflate") => {
+                flate2::read::ZlibDecoder::new(body.as_ref()).read_to_end(&mut decoded)?;
+            }
+            Some("zstd") => decoded = zstd::stream::decode_all(body.as_ref())?,
+            None => decoded.extend_from_slice(&body),
+            _ => unreachable!(),
+        }
+        assert_equal!(decoded.as_slice(), expected.as_ref());
+    }
+
+    daemon.stop_both().await.context("stop_both")?;
+    daemon.assert_no_acct_deny().await?;
     Ok(())
 }
