@@ -2,6 +2,7 @@ use crate::kumod::DaemonWithMaildir;
 use anyhow::Context;
 use bstr::ByteSlice;
 use k9::assert_equal;
+use kumo_log_types::RecordType;
 use std::time::Duration;
 
 /// Test HTTP injection with gzip compressed request body
@@ -154,6 +155,103 @@ async fn http_inject_compression_deflate() -> anyhow::Result<()> {
     let parsed = messages[0].parsed()?;
 
     assert_equal!(parsed.headers().subject().unwrap().unwrap(), "Deflate Test");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_inject_compression_zstd() -> anyhow::Result<()> {
+    let mut daemon = DaemonWithMaildir::start()
+        .await
+        .context("DaemonWithMaildir::start")?;
+
+    let expected_body = "Hello Test User! This is a Zstd-compressed message.\r\n".repeat(100);
+    let payload = serde_json::json!({
+        "envelope_sender": "sender@example.com",
+        "recipients": [{"email": "user@example.com"}],
+        "template_dialect": "Static",
+        "content": format!("Subject: Zstd Test\r\n\r\n{expected_body}")
+    });
+    let json_data = serde_json::to_vec(&payload)?;
+    let compressed_data = zstd::stream::encode_all(json_data.as_slice(), 1)?;
+    assert!(compressed_data.len() < json_data.len());
+
+    let response = reqwest::Client::new()
+        .post(&format!(
+            "http://{}/api/inject/v1",
+            daemon.source.listener("http")
+        ))
+        .header("Content-Encoding", "zstd")
+        .header("Content-Type", "application/json")
+        .body(compressed_data)
+        .send()
+        .await?;
+
+    assert_equal!(response.status(), 200);
+    let response_json: serde_json::Value = response.json().await?;
+    assert_equal!(response_json["success_count"], 1);
+    assert_equal!(response_json["fail_count"], 0);
+
+    daemon
+        .wait_for_maildir_count(1, Duration::from_secs(10))
+        .await;
+    daemon.stop_both().await.context("stop_both")?;
+    daemon.assert_no_acct_deny().await?;
+
+    let mut messages = daemon.extract_maildir_messages()?;
+    assert_equal!(messages.len(), 1);
+    let parsed = messages[0].parsed()?;
+    assert_equal!(parsed.headers().subject().unwrap().unwrap(), "Zstd Test");
+    match parsed.body().unwrap() {
+        mailparsing::DecodedBody::Text(text) => {
+            assert_equal!(text.as_bytes(), expected_body.as_bytes());
+        }
+        _ => panic!("Expected text body"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_inject_compression_zstd_invalid() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut daemon = DaemonWithMaildir::start()
+        .await
+        .context("DaemonWithMaildir::start")?;
+
+    let payload = serde_json::json!({
+        "envelope_sender": "sender@example.com",
+        "recipients": [{"email": "user@example.com"}],
+        "content": "Subject: Invalid Zstd\r\n\r\nMust not be delivered"
+    });
+    let json_data = serde_json::to_vec(&payload)?;
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1)?;
+    encoder.include_checksum(true)?;
+    encoder.write_all(&json_data)?;
+    let compressed_data = encoder.finish()?;
+
+    // Keep the decoded JSON intact, but omit part of the frame checksum.
+    let truncated = compressed_data[..compressed_data.len() - 1].to_vec();
+    let client = reqwest::Client::new();
+    for body in [b"not a zstd frame".to_vec(), truncated] {
+        let response = client
+            .post(&format!(
+                "http://{}/api/inject/v1",
+                daemon.source.listener("http")
+            ))
+            .header("Content-Encoding", "zstd")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        assert_equal!(response.status(), 400);
+    }
+
+    daemon.stop_both().await.context("stop_both")?;
+    assert_equal!(daemon.extract_maildir_messages()?.len(), 0);
+    let summary = daemon.dump_logs().await.context("dump_logs")?;
+    assert_equal!(summary.source_counts.get(&RecordType::Reception), None);
 
     Ok(())
 }

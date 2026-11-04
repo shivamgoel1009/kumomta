@@ -304,7 +304,10 @@ impl HttpListenerParams {
             .deflate(true)
             .gzip(true)
             .quality(tower_http::CompressionLevel::Fastest);
-        let decompression_layer = RequestDecompressionLayer::new().deflate(true).gzip(true);
+        let decompression_layer = RequestDecompressionLayer::new()
+            .deflate(true)
+            .gzip(true)
+            .zstd(true);
 
         let socket = TcpListener::bind(&self.listen)
             .with_context(|| format!("listen on {}", self.listen))?;
